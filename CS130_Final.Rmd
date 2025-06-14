@@ -1,0 +1,792 @@
+---
+title: "CS130 Final Project"
+author: "Aida Mazyte, Chiffon Nguyen"
+date: "December 15, 2023"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    df_print: paged
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+    number_sections: yes
+    keep_tex: no
+    df_print: paged
+    highlight: tango
+editor_options:
+  markdown:
+    wrap: 72
+---
+# Introduction 
+
+Replication for the 2021 paper "Philadelphia’s Excise Tax on Sugar-Sweetened and Artificially Sweetened Beverages and Supplemental Nutrition Assistance Program Benefit Redemption" by Benjamin W. Chrisinger. 
+
+# [O] Clean data
+
+Set up
+
+```{r libraries, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+libraries_to_install <- c("knitr", "dplyr", "readr", "reshape2", "lubridate", 
+                          "GGally", "Synth", "foreach", "doParallel")
+
+# Check if each library is already installed, and install it if not
+libraries_not_installed <- libraries_to_install[
+  !sapply(libraries_to_install, requireNamespace, quietly = TRUE)]
+
+if (length(libraries_not_installed) > 0) {
+  install.packages(libraries_not_installed, dependencies = TRUE)
+}
+
+# Check if the libraries are successfully loaded
+if (!all(sapply(libraries_to_install, requireNamespace, quietly = TRUE))) {
+  message("Some libraries failed to load. Switch to manual installation")
+}
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(doParallel)
+
+# Set up parallel processing
+cl <- makeCluster(detectCores()-2)
+registerDoParallel(cl)
+```
+
+Read data, skip columns 1-2
+
+```{r read_data, message=FALSE, warning=FALSE}
+d0 = read_csv("final_dataset.csv", col_select = 3:13)
+str(d0)
+```
+
+From the original paper code: 
+
+1. Rearrange the data by year in the ascending order (2005-2019). 
+2. Make sure every year has two data points: in January and July 
+3. Create a `time` counter: 1 for Jan 2005, 2 for July 2005, 3 for Jan 2006, etc. This will be used as the `time.variable` for synthetic control
+
+```{r data_time}
+
+# Make sure every year has two data points: in January and July
+d0 = d0[month(as.Date(paste0(d0$Date,"-01"))) %in% c(1,7),]
+d0 = d0[d0$Year>=2005 & d0$Year<=2019,]
+d0 = d0[!d0$Date %in% c("2019-01"),]
+
+posttreat.last.halfyear = length(unique(d0$Date)) # 29
+pretreat.last.halfyear = length(unique(d0[d0$Year<2017,]$Date)) # 24
+
+# Create time reference table (Date & time counter)
+timekey = data.frame(Date=names(table(unique(d0$Date))),
+                     time=seq(1:posttreat.last.halfyear))
+
+# Left merge
+d0 = merge(d0, timekey, by="Date", all.x=TRUE, sort = TRUE)
+```
+
+Turn data into more readable format
+
+```{r data_time_read}
+timekey$half.year <- format(as.Date(paste0(timekey$Date, "-01")), "%b %Y")
+```
+
+Remove counties with missing values under columns `Snap.Benefits.USDA` and `Snap.Individuals.USDA`
+
+```{r}
+d0 = d0[!d0$county_state %in% 
+          unique(d0[is.na(d0$Snap.Benefits.USDA),]$county_state),]
+d0 = d0[!d0$county_state %in% 
+          unique(d0[is.na(d0$Snap.Individuals.USDA),]$county_state),]
+d0 = d0[!d0$county_state %in% 
+          unique(d0[is.na(d0$Unemployment.Rate),]$county_state),]
+```
+
+Transform some predictor variables to log scale
+
+```{r data_log}
+d0$log.Redemption.Amt = log(d0$Redemption.Amt)
+d0$log.Snap.Individuals.USDA = log(d0$Snap.Individuals.USDA)
+d0$log.Snap.Benefits.USDA = log(d0$Snap.Benefits.USDA)
+d0$log.Authorized.Stores = log(d0$Authorized.Stores)
+d0$log.population.5yr = log(d0$population.5yr)
+```
+
+Add the outcome for SNAP redemption per participant
+
+```{r data_outcome}
+d0$Redemption.Amt.PC = d0$Redemption.Amt / d0$Snap.Individuals.USDA
+```
+
+Change the unemployment rate from `double` (fraction) to `numeric`
+```{r data_type}
+d0$Unemployment.Rate = as.numeric(d0$Unemployment.Rate)
+```
+
+Remove counties that have been found to exhibit strange high/low cycles,
+spikes, and other anomalies in outcome or predictor variables
+
+```{r data_abnormal}
+d0 = d0[!d0$county_state %in% c("Ventura County, CA", 
+                                 "Santa Barbara County, CA", 
+                                 "Monterey County, CA", 
+                                 "Horry County, SC",
+                                 "Tulsa County, OK",
+                                 "Fresno County, CA",
+                                 "New Castle County, DE",
+                                 "Stark County, OH",
+                                 "Baltimore County, MD",
+                                 "Kern County, CA",
+                                 "Williamson County, TX",
+                                 "Cook County, IL"),]
+```
+
+Remove counties without complete data (only include counties with two
+data points per year)
+
+```{r data_complete}
+# new dataframe counts of each unique value in the county_state column 
+n_obs = data.frame(table(d0$county_state))
+
+# include only counties with complete data 
+complete = unique(n_obs[n_obs$Freq==posttreat.last.halfyear,]$Var1)
+d0 = d0[d0$county_state %in% complete,]
+```
+
+Reassign county ID
+
+```{r data_id}
+newid = data.frame(county_state=unique(d0$county_state),
+                   id = seq_len(length(unique(d0$county_state))))
+d0 = merge(d0, newid, by="county_state")
+d0$county_id = d0$id
+d0 = d0 %>%
+  arrange(id, time)
+```
+
+# Synthetic Control Setup
+
+## [O] Filter similar counties
+
+Package the code from the original paper into a function:
+
+1.  Compute median values for predictor variables
+2.  For two different time periods (pre-2012 and 2012-2015), compute the
+    intercept and slope of the linear regression model for the logarithm
+    of Redemption.Amt over time.
+3.  Identify counties whose slope of SNAP redemption is within a certain
+    range of the treatment county's slope
+4.  Select counties whose predictor variables are within certain ranges
+    of the treatment county's averages
+
+```{r}
+
+study.counties = c("Philadelphia County, PA", "Montgomery County, PA", 
+                   "Delaware County, PA", "Bucks County, PA")
+
+get_similar_counties <- function(
+    d, treatment.county, span1=1.25, span2=1.25, span3=5) {
+  
+  # Step 0: Remove neighbors
+  neighbors.to.remove = setdiff(study.counties, treatment.county)
+  d = d[!d$county_state %in% neighbors.to.remove, ]
+  
+  # Step 1: Compute median values for predictor variables 
+  pred_avgs = d[d$time < pretreat.last.halfyear, ] %>%
+    group_by(county_state) %>%
+    summarise(
+      Authorized.Stores = median(Authorized.Stores, na.rm = TRUE),
+      Unemployment.Rate = median(Unemployment.Rate, na.rm = TRUE),
+      Snap.Individuals.USDA = median(Snap.Individuals.USDA, na.rm = TRUE),
+      Snap.Benefits.USDA = median(Snap.Benefits.USDA, na.rm = TRUE),
+      population.5yr = median(population.5yr, na.rm = TRUE)
+    )
+
+  treat_avgs = pred_avgs[pred_avgs$county_state == treatment.county, ]
+
+  # Step 2.1: Compute the intercept and slope of the linear regression Pre-2012
+  slope_avgs.1 = d[d$Year < 2012, ] %>%
+    group_by(county_state) %>%
+    do({
+      mod = lm(log.Redemption.Amt ~ time, data = .)
+      data.frame(Intercept = coef(mod)[1], Slope = coef(mod)[2])
+    })
+
+  treat_avgs.1 = slope_avgs.1[slope_avgs.1$county_state == treatment.county, ]
+
+  # Step 2.2: Compute the intercept and slope of the linear regression 2012-2015
+  slope_avgs.2 = d[d$Year >= 2012 & d$Year <= 2015, ] %>%
+    group_by(county_state) %>%
+    do({
+      mod = lm(log.Redemption.Amt ~ time, data = .)
+      data.frame(Intercept = coef(mod)[1], Slope = coef(mod)[2])
+    })
+
+  treat_avgs.2 = slope_avgs.2[slope_avgs.2$county_state == treatment.county, ]
+
+  # Step 3:  Identify counties whose slope of SNAP redemption is within 
+  # a certain range of the treatment county's slope
+  preds.1 = slope_avgs.1[
+    (slope_avgs.1$Slope < treat_avgs.1$Slope * span1 &
+       slope_avgs.1$Slope > treat_avgs.1$Slope * (1 / span1)), ]$county_state
+
+  preds.2 = if (treat_avgs.2$Slope > 0) {
+    slope_avgs.2[(slope_avgs.2$Slope < treat_avgs.2$Slope * span2 &
+                    slope_avgs.2$Slope > treat_avgs.2$Slope * (1 / span2)), ]$county_state
+  } else {
+    slope_avgs.2[(slope_avgs.2$Slope > treat_avgs.2$Slope * span2 &
+                    slope_avgs.2$Slope < treat_avgs.2$Slope * (1 / span2)), ]$county_state
+  }
+
+  # Step 4: Select counties based on proximity of predictor variables 
+  # with treatment county
+  preds.3 = pred_avgs[
+    (pred_avgs$Authorized.Stores < treat_avgs$Authorized.Stores * span3 &
+       pred_avgs$Authorized.Stores > treat_avgs$Authorized.Stores * (1 / span3) &
+       pred_avgs$Unemployment.Rate < treat_avgs$Unemployment.Rate + span3 &
+       pred_avgs$Unemployment.Rate > treat_avgs$Unemployment.Rate - span3 &
+       pred_avgs$Snap.Individuals.USDA < 
+          treat_avgs$Snap.Individuals.USDA * span3 &
+       pred_avgs$Snap.Individuals.USDA > 
+          treat_avgs$Snap.Individuals.USDA * (1 / span3) &
+       pred_avgs$Snap.Benefits.USDA < treat_avgs$Snap.Benefits.USDA * span3 &
+       pred_avgs$Snap.Benefits.USDA > treat_avgs$Snap.Benefits.USDA * (1 / span3) &
+       pred_avgs$population.5yr < treat_avgs$population.5yr * span3 &
+       pred_avgs$population.5yr > treat_avgs$population.5yr * (1 / span3)
+    ), ]$county_state
+
+  # Remove counties predictors that aren't close to the treatment county
+  d_filtered = d[(d$county_state %in% preds.1 &
+                    d$county_state %in% preds.2 &
+                    d$county_state %in% preds.3), ]
+
+  return(d_filtered)
+}
+```
+
+Set up a dataframe for counties only. There are 2702 counties in the raw
+donor pool.
+
+```{r}
+donor_pool = data.frame(county_id = unique(d0$county_id),
+                        county_state = unique(d0$county_state))
+nrow(donor_pool)
+```
+
+## [D] Check missing values among predictors 
+```{r}
+colSums(is.na(d0))
+```
+
+## [D] Check multicollinearity between predictors 
+
+This is an extra step that the author didn't perform in the paper. We need to ensure that the matrix involved in the calculations for synthetic control is invertible, by avoiding perfect multicollinearity among the predictors.
+
+In short, we try to find out predictors that are highly correlated.
+
+```{r message=FALSE, warning=FALSE}
+library(GGally)
+
+vars <- c("Unemployment.Rate",  
+          "log.Redemption.Amt",
+          "Redemption.Amt.PC",
+          "log.Snap.Individuals.USDA", 
+          "log.Snap.Benefits.USDA",
+          "log.Authorized.Stores", 
+          "log.population.5yr")
+
+# exclude NAs when calculate pairwise Pearson's correlation
+ggcorr(d0[, vars], use = "pairwise.complete.obs", palette = "RdYlBu") +
+  ggtitle("Correlation Heatmap")
+```
+`log.Redemtion.Amt` is almost perfectly correlated with `log.population.5yr` and `log.Authorized.Stores`. `log.population.5yr` and `log.Authorized.Stores` are also highly correlated.
+
+In this case, `log.population.5yr` should not be used as a predictor at any time.
+
+## [D] Run synthetic control
+```{r synth_total, message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(Synth)
+
+set.seed(1)
+
+run_synth_total <- function(treatment.county) {
+  # Step 1: Get Similar Counties
+  d = get_similar_counties(
+    d0, 
+    treatment.county = treatment.county,
+    span1 = 3, span2 = 3, span3 = 7
+  )
+  
+  # Step 2: Get Identifier of Treatment and Control Units
+  j = donor_pool %>%
+    filter(county_state == treatment.county) %>%
+    select(county_id) %>%
+    pull()
+  controlunits = setdiff(unique(d$id), j)
+  
+  # Step 3: Dataprep
+  dataprep.out <- dataprep(
+    foo = d,
+    predictors    = c("Unemployment.Rate", 
+                      "log.Authorized.Stores",
+                      "log.Snap.Individuals.USDA", 
+                      "log.Snap.Benefits.USDA"), 
+    dependent     = "log.Redemption.Amt",
+    special.predictors = list(
+      list("log.Redemption.Amt", seq(from = 2, to = 2, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 4, to = 4, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 6, to = 6, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 8, to = 8, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 10, to = 10, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 12, to = 12, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 14, to = 14, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 16, to = 16, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 18, to = 18, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 20, to = 20, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 22, to = 22, by = 1), "mean"),
+      list("log.Redemption.Amt", seq(from = 24, to = 24, by = 1), "mean")),
+    unit.variable = "id",
+    time.variable = "time",
+    treatment.identifier = j,
+    controls.identifier = controlunits,
+    time.predictors.prior = 1:pretreat.last.halfyear,
+    time.optimize.ssr = 1:pretreat.last.halfyear,
+    unit.names.variable = "county_state",
+    time.plot = 1:posttreat.last.halfyear)
+  
+  # Step 4: Synthetic control
+  synth.out <- synth(
+    data.prep.obj = dataprep.out,
+    optimxmethod = c("CG", "L-BFGS-B", "nlm", "nlminb", "spg", "ucminf"),
+    quadopt = "ipop")
+  
+  # Return the results as a list
+  return(list(dataprep.out = dataprep.out, synth.out = synth.out))
+}
+```
+
+
+# Figure 2 Replication
+
+## Figure 2a. Total SNAP Redemption
+
+Run synthetic control to get the gaps (treated - control)
+```{r gaps_total, message=FALSE, warning=FALSE, include=FALSE}
+library(reshape2)
+
+gaps <- tibble(half.year = timekey$Date)
+dataprep.out.list <- list()
+synth.out.list <- list()
+
+for (county.name in study.counties) {
+  # Get first 4 letters of full county_name
+  county <- substr(county.name, 1, 4)
+  
+  # Run synthetic control
+  synth.results <- run_synth_total(county.name)
+  
+  # Save dataprep.out and synth.out
+  dataprep.out.list[[county]] <- synth.results$dataprep.out
+  synth.out.list[[county]] <- synth.results$synth.out
+  
+  # Get the log outcome (treat county & synthetic control)
+  logY1 = synth.results$dataprep.out$Y1plot
+  logY0 = synth.results$dataprep.out$Y0plot
+  weights = synth.results$synth.out$solution.w
+  
+  # Calculate the gap between treated and control
+  # log-scaled to normal scale to million dollars
+  gap_mil = as.numeric((exp(logY1) - (exp(logY0) %*% weights)) / 1e7)
+  
+  gaps = mutate(gaps, !!county := gap_mil)
+}
+
+# Reshape the data to long form to plot
+gaps.to.plot <- melt(gaps, 
+                    id.vars = "half.year",
+                    variable.name = "county", 
+                    value.name = "gap.redemption.million")
+```
+
+Plot the gaps
+
+```{r fig2a}
+library(ggplot2)
+
+# Figure 2a
+ggplot(gaps.to.plot, aes(x = half.year, 
+                         y = gap.redemption.million, 
+                         color = county,
+                         group = county,
+                         shape = county)) +
+  geom_line(linewidth = 0.5, linetype = 1) +
+  geom_point(size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  geom_vline(xintercept = "2017-01", linetype = "dashed", color = "black") +
+  labs(title = "2a. Gaps in SNAP Redemption for 4 counties",
+       x = "Date",
+       y = "Gaps in SNAP Redemption ($ Million)",
+       color = NULL,
+       shape = NULL) +
+  scale_x_discrete(labels = timekey$half.year) +
+  scale_y_continuous(breaks = seq(-1, 3, 0.5)) +
+  scale_color_manual(values = c("Phil" = "gray3", 
+                                "Buck" = "orange", 
+                                "Dela" = "blue", 
+                                "Mont" = "limegreen"),
+                     labels = c("Phil" = "Philadelphia County",
+                                "Buck" = "Bucks County",
+                                "Dela" = "Delaware County",
+                                "Mont" = "Montgomery County")) +
+  scale_shape_manual(values = c("Phil" = 15, "Buck" = 16, "Dela" = 18, "Mont" = 17),
+                     labels = c("Phil" = "Philadelphia County",
+                                "Buck" = "Bucks County",
+                                "Dela" = "Delaware County",
+                                "Mont" = "Montgomery County")) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-label ticks
+    panel.border = element_blank(),      # Remove panel border
+    legend.position = c(0.02, 0.99),  # Adjust legend position
+    legend.justification = c(0, 1),   # Adjust legend justification
+    legend.box.background = element_rect(color = "black"),  # Border around legend
+    legend.text = element_text(size=8),
+    legend.key.size = unit(0.5, 'cm'), 
+    legend.key.height = unit(0.3, 'cm'), 
+    legend.key.width = unit(1, 'cm')
+  )
+```
+
+## Figure 2b. SNAP Redemption Per Participant
+
+```{r synth_perperson, message=FALSE, warning=FALSE, include=FALSE}
+
+# SAME CONFIGURATION AS AUTHOR's 5a
+run_synth_per_participant <- function(treatment.county) {
+  # Step 1: Get Similar Counties
+  d = get_similar_counties(
+    d0, 
+    treatment.county = treatment.county,
+    span1 = 3, span2 = 3, span3 = 7
+  )
+  
+  # Step 2: Get Identifier of Treatment and Control Units
+  j = donor_pool %>%
+    filter(county_state == treatment.county) %>%
+    select(county_id) %>%
+    pull()
+  controlunits = setdiff(unique(d$id), j)
+  
+  # Step 3: Dataprep
+  dataprep.out <- dataprep(
+    foo = d,
+    predictors    = c("Unemployment.Rate", 
+                      "log.Authorized.Stores",
+                      "log.Snap.Individuals.USDA", 
+                      "log.Snap.Benefits.USDA"), 
+    dependent     = "Redemption.Amt.PC",
+    special.predictors = list(
+        list("Redemption.Amt.PC", seq(from = 2, to = 2, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 4, to = 4, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 6, to = 6, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 8, to = 8, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 10, to = 10, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 12, to = 12, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 14, to = 14, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 16, to = 16, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 18, to = 18, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 20, to = 20, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 22, to = 22, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 24, to = 24, by = 1), "mean")),
+    unit.variable = "id",
+    time.variable = "time",
+    treatment.identifier = j,
+    controls.identifier = controlunits,
+    time.predictors.prior = 1:pretreat.last.halfyear,
+    time.optimize.ssr = 1:pretreat.last.halfyear,
+    unit.names.variable = "county_state",
+    time.plot = 1:posttreat.last.halfyear)
+  
+  # Step 4: Synthetic control
+  synth.out <- synth(
+    data.prep.obj = dataprep.out,
+    optimxmethod = c("DEoptC", "malschains", "nlminb")
+    )
+  
+  # Return the results as a list
+  return(list(dataprep.out = dataprep.out, synth.out = synth.out))
+}
+```
+
+Run synthetic control to get the gaps (treated - control)
+```{r gaps, message=FALSE, warning=FALSE, include=FALSE}
+
+pc.gaps <- tibble(half.year = timekey$Date)
+pc.dataprep.out.list <- list()
+pc.synth.out.list <- list()
+
+for (county.name in study.counties) {
+  # Get first 4 letters of full county_name
+  county <- substr(county.name, 1, 4)
+  
+  # Run synthetic control
+  synth.results <- run_synth_per_participant(county.name)
+  
+  # Save dataprep.out and synth.out
+  pc.dataprep.out.list[[county]] <- synth.results$dataprep.out
+  pc.synth.out.list[[county]] <- synth.results$synth.out
+  
+  # Get the outcome per participant (treat county & synthetic control)
+  Y1 = synth.results$dataprep.out$Y1plot
+  Y0 = synth.results$dataprep.out$Y0plot
+  weights = synth.results$synth.out$solution.w
+  
+  # Calculate the gap between treated and control per participant (in dollars)
+  gap_mil = as.numeric(Y1 - Y0 %*% weights) 
+  
+  pc.gaps = mutate(pc.gaps, !!county := gap_mil)
+}
+```
+
+```{r}
+# Reshape the data to long form to plot
+pcgaps.to.plot <- melt(pc.gaps, 
+                    id.vars = "half.year",
+                    variable.name = "county", 
+                    value.name = "pc.gap.redemption")
+```
+
+Plot the gaps
+
+```{r fig2b, message=FALSE, warning=FALSE}
+# Figure 2b
+ggplot(pcgaps.to.plot, aes(x = half.year, 
+                         y = pc.gap.redemption, 
+                         color = county,
+                         group = county,
+                         shape = county)) +
+  geom_line(linewidth = 0.5, linetype = 1) +
+  geom_point(size = 2) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  geom_vline(xintercept = "2017-01", linetype = "dashed", color = "black") +
+  labs(title = "2b. Gaps in SNAP Redemption Per Participant for 4 counties",
+       x = "Date",
+       y = "Gaps in SNAP Redemption ($)",
+       color = NULL,
+       shape = NULL) +
+  scale_x_discrete(labels = timekey$half.year) +
+  scale_y_continuous(breaks = seq(-10, 60, 10)) +
+  scale_color_manual(values = c("Phil" = "gray3", 
+                                "Buck" = "orange", 
+                                "Dela" = "blue", 
+                                "Mont" = "limegreen"),
+                     labels = c("Phil" = "Philadelphia County",
+                                "Buck" = "Bucks County",
+                                "Dela" = "Delaware County",
+                                "Mont" = "Montgomery County")) +
+  scale_shape_manual(values = c("Phil" = 15, "Buck" = 16, 
+                                "Dela" = 18, "Mont" = 17),
+                     labels = c("Phil" = "Philadelphia County",
+                                "Buck" = "Bucks County",
+                                "Dela" = "Delaware County",
+                                "Mont" = "Montgomery County")) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-label ticks
+    panel.border = element_blank(),      # Remove panel border
+    legend.position = c(0.02, 0.99),  # Adjust legend position
+    legend.justification = c(0, 1),   # Adjust legend justification
+    legend.box.background = element_rect(color = "black"),  
+    legend.text = element_text(size=8),
+    legend.key.size = unit(0.5, 'cm'), 
+    legend.key.height = unit(0.3, 'cm'), 
+    legend.key.width = unit(1, 'cm')
+  )
+# ggsave("fig2b.png")
+```
+
+# Extension: Leave-one-out Robustness Check
+
+```{r loo_func, message=FALSE, warning=FALSE, include=FALSE}
+library(foreach)
+
+global_vars <- c("d0", "donor_pool", "timekey",
+                 "pretreat.last.halfyear", "posttreat.last.halfyear")
+
+# Export global variables to the parallel workers
+clusterExport(cl, global_vars)
+
+# Modify the synthetic control functions
+loo_synth_per_participant <- function(treatment.county) {
+  # Step 1: Get Similar Counties
+  d = get_similar_counties(
+    d0, 
+    treatment.county = treatment.county,
+    span1 = 3, span2 = 3, span3 = 7
+  )
+  
+  # Step 2: Get Identifier of Treatment and Control Units
+  j = donor_pool %>%
+    filter(county_state == treatment.county) %>%
+    select(county_id) %>%
+    pull()
+  controlunits = setdiff(unique(d$id), j)
+  
+  # Create an empty ... to store the gaps
+  loo.gaps <- data.frame()
+  
+  # Iterate over each control unit for leave-one-out
+  loo.gaps <- foreach(control_unit = controlunits, .combine = rbind, 
+                      .packages = "Synth") %dopar% {
+    
+    # Step 3: Dataprep for the current leave-one-out iteration
+    dataprep.out <- dataprep(
+      foo = d[d$id != control_unit, ],  # Exclude the current control unit
+      predictors = c("Unemployment.Rate", 
+                     "log.Authorized.Stores",
+                     "log.Snap.Individuals.USDA", 
+                     "log.Snap.Benefits.USDA"), 
+      dependent = "Redemption.Amt.PC",
+      special.predictors = list(
+        list("Redemption.Amt.PC", seq(from = 2, to = 2, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 4, to = 4, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 6, to = 6, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 8, to = 8, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 10, to = 10, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 12, to = 12, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 14, to = 14, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 16, to = 16, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 18, to = 18, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 20, to = 20, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 22, to = 22, by = 1), "mean"),
+        list("Redemption.Amt.PC", seq(from = 24, to = 24, by = 1), "mean")),
+      unit.variable = "id",
+      time.variable = "time",
+      treatment.identifier = j,
+      controls.identifier = setdiff(controlunits, control_unit),
+      time.predictors.prior = 1:pretreat.last.halfyear,
+      time.optimize.ssr = 1:pretreat.last.halfyear,
+      unit.names.variable = "county_state",
+      time.plot = 1:posttreat.last.halfyear)
+    
+    # Step 4: Synthetic control for the current leave-one-out iteration
+    synth.out <- synth(
+      data.prep.obj = dataprep.out,
+      optimxmethod = c("DEoptC", "malschains", "nlminb"),
+      quadopt = "ipop"
+    )
+    
+    # Store current gap between treated and control
+    gap <- as.numeric(
+      dataprep.out$Y1plot - (dataprep.out$Y0plot %*% synth.out$solution.w)
+    )
+
+    # Store in loo.gaps
+    data.frame(
+      half.year = timekey$Date,
+      county = as.character(control_unit), 
+      gap = gap)
+  }
+  
+  # Return the list of results for all leave-one-out iterations
+  return(loo.gaps)
+}
+
+# loo.bucks = loo_synth_per_participant("Bucks County, PA")
+```
+
+```{r}
+loo.phil = loo_synth_per_participant("Philadelphia County, PA")
+loo.dela = loo_synth_per_participant("Delaware County, PA")
+loo.mont = loo_synth_per_participant("Montgomery County, PA")
+
+```
+
+```{r loo_run, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+
+loo.gaps.list <- list()
+
+for (county.name in study.counties) {
+  # Get first 4 letters of full county_name
+  county <- substr(county.name, 1, 4)
+  
+  # Run leave-one-out on the current county
+  loo.gaps <- loo_synth_per_participant(county.name)
+  
+  # Add loo.gaps to loo.gaps.list by "county"
+  loo.gaps.list[[county]] = loo.gaps
+}
+
+# Stop parallel processing
+stopCluster(cl)
+```
+
+## Philadelphia
+```{r}
+ggplot(loo.phil, aes(x = half.year, y = gap, group = county)) +
+  geom_line(linewidth = 0.5, linetype = 1, color = "gray") +
+  geom_point(size = 1, color = "gray") + 
+  geom_line(data = pcgaps.to.plot[pcgaps.to.plot$county == "Phil", ], 
+            aes(x = half.year, y = pc.gap.redemption), 
+            linetype = 1, color = "black", size = 1) +  # Add the new line
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  geom_vline(xintercept = "2017-01", linetype = "dashed", color = "black") +
+  labs(title = "Leave-one-out Analysis for Philadelphia
+       SNAP Redemption per participant", 
+       x = "Date",
+       y = "Gaps in SNAP Redemption ($)") +
+  scale_x_discrete(labels = timekey$half.year) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-label ticks
+    panel.border = element_blank(),      # Remove panel border
+  )
+```
+
+## Delaware
+```{r}
+ggplot(loo.dela, aes(x = half.year, y = gap, group = county)) +
+  geom_line(linewidth = 0.5, linetype = 1, color = "gray") +
+  geom_point(size = 1, color = "gray") + 
+  geom_line(data = pcgaps.to.plot[pcgaps.to.plot$county == "Dela", ], 
+            aes(x = half.year, y = pc.gap.redemption), 
+            linetype = 1, color = "black", size = 1) +  # Add the new line
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  geom_vline(xintercept = "2017-01", linetype = "dashed", color = "black") +
+    labs(title = "Leave-one-out Analysis for Delaware
+       SNAP Redemption per participant", 
+       x = "Date",
+       y = "Gaps in SNAP Redemption ($)") +
+  scale_x_discrete(labels = timekey$half.year) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-label ticks
+    panel.border = element_blank(),      # Remove panel border
+  )
+```
+
+## Montgomery
+```{r}
+ggplot(loo.mont, aes(x = half.year, y = gap, group = county)) +
+  geom_line(linewidth = 0.5, linetype = 1, color = "gray") +
+  geom_point(size = 1, color = "gray") + 
+  geom_line(data = pcgaps.to.plot[pcgaps.to.plot$county == "Mont", ], 
+            aes(x = half.year, y = pc.gap.redemption), 
+            linetype = 1, color = "black", size = 1) +  # Add the new line
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  geom_vline(xintercept = "2017-01", linetype = "dashed", color = "black") +
+    labs(title = "Leave-one-out Analysis for Montgomery
+       SNAP Redemption per participant", 
+       x = "Date",
+       y = "Gaps in SNAP Redemption ($)") +
+  scale_x_discrete(labels = timekey$half.year) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-label ticks
+    panel.border = element_blank(),      # Remove panel border
+  )
+```
+
+## Bucks
