@@ -1,4 +1,6 @@
-# Synthetic Control
+# Synthetic Control Replication
+
+[RPub](https://rpubs.com/chiffonng/cs130-final) | [Replication Data Used](https://ora.ox.ac.uk/objects/uuid:74e97397-1f7b-4b44-b22c-899d74fa0b83/files/dbv73c0570)
 
 This is a response to the 2021 study "[Philadelphia’s Excise Tax on Sugar-Sweetened and Artificially Sweetened Beverages and Supplemental Nutrition Assistance Program Benefit Redemption](https://pmc.ncbi.nlm.nih.gov/articles/PMC8630475/)" by Benjamin W. Chrisinger. It was done in R as the final assignment for Minerva University class on Causal Inference taught by Professor Alexis Diamond (one of the people who created synthetic control method and package).
 
