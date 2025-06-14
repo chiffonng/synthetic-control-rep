@@ -8,4 +8,5 @@ While we are able to replicate similar trends, the magnitude of the effects diff
 
 ## Contritbution Statement
 Chiffon: dedicated extensive amount of time to clean the data, write the code to replicate the figure and to produce the leave-one-out analysis. Contributed to the write-up by helping to interpret the results and reviewing.
+
 Aida: reviewed the code, contributed to the leave-one-out analysis and debugging. Produced the write-up of the assignment, ensured the following of assignment instructions.
